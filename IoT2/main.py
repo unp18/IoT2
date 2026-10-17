@@ -677,7 +677,20 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
     await room.to_clients({"type": "presence", "device_online": bool(room.devices)})
     
     if role == "device":
-        await room.to_devices({"type": "message", "role": "system", "text": "Hardware Online. Battery stable and ready to record."})
+        greeting = "Hi there! I'm powered up, connected, and ready to chat. What's on your mind?"
+    
+    # 1. Send lightweight text to ESP32 Serial Monitor
+        await room.to_devices({"type": "message", "role": "system", "text": greeting})
+    
+    # 2. Save it to the database and send to the webapp as a chat message
+        conv = await adb(db_ensure_conversation, device_id, room.active_conversation)
+        room.active_conversation = conv["id"]
+        msg = await adb(db_add_message, conv["id"], "assistant", greeting, "system")
+    
+        await room.to_clients({
+            "type": "message", "role": "assistant", "id": msg["id"], "text": greeting,
+            "conversation_id": conv["id"], "source": "system", "created_at": msg["created_at"]
+        })
     pending_meta: Optional[dict] = None
     pending_audio = bytearray()
     
