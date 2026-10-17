@@ -18,6 +18,7 @@
 html,body{height:100%;margin:0}
 body{font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);
   padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+[hidden]{display:none!important}
 button{font:inherit;color:inherit;cursor:pointer}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .app{display:grid;grid-template-columns:280px 1fr;height:100%}
@@ -196,7 +197,12 @@ function connect(){
   ws.onopen = () => { S.connected = true; renderDevice(); };
   ws.onclose = () => { S.connected = false; S.online = false; renderDevice(); renderState();
                        S.retry = setTimeout(connect, 2000); };
-  ws.onmessage = e => typeof e.data === 'string' ? onEvent(JSON.parse(e.data)) : playChunk(e.data);
+  ws.onmessage = e => {
+    if (typeof e.data !== 'string') return playChunk(e.data);
+    const m = JSON.parse(e.data);
+    if (m.type !== 'token') console.debug('event', m);
+    try { onEvent(m); } catch (err) { console.error('handler failed', m, err); }
+  };
 }
 const send = obj => S.ws && S.ws.readyState === 1 && S.ws.send(JSON.stringify(obj));
 
@@ -330,7 +336,7 @@ function newChat(){
 const input = $('#input');
 function sendText(){
   const text = input.value.trim();
-  if (!text || S.status !== 'idle') return;
+  if (!text) return;
   unlockAudio();
   if (!S.conv) S.awaitingNew = true;
   send({ type:'text', text, conversation_id:S.conv });
@@ -347,7 +353,6 @@ function unlockAudio(){ actx = actx || new (window.AudioContext || window.webkit
 
 async function micStart(e){
   e.preventDefault();
-  if (S.status !== 'idle') return;
   holding = true; unlockAudio();
   if (!navigator.mediaDevices || !window.MediaRecorder){
     holding = false; return toast('The microphone needs a secure (https) connection'); }
