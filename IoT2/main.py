@@ -675,9 +675,13 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
         "telemetry": {"temp": room.telemetry["temp"], "hum": room.telemetry["hum"]},
     }))
     await room.to_clients({"type": "presence", "device_online": bool(room.devices)})
+    
     if role == "device":
         await start_turn(room, source="system", text="The smart speaker just powered on. Say a short, friendly 1-sentence greeting so the user knows you are online and ready.")
+    
     pending_meta: Optional[dict] = None
+    pending_audio = bytearray()
+    
     try:
         while True:
             msg = await ws.receive()
@@ -708,6 +712,21 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
 
                 elif kind == "audio_meta":
                     pending_meta = data
+                    pending_audio.clear()
+
+                elif kind == "audio_end":
+                    if pending_audio:
+                        meta, pending_meta = pending_meta or {}, None
+                        default_mime = "audio/pcm" if role == "device" else "audio/webm"
+                        mime = meta.get("mime", default_mime)
+                        conv_id = meta.get("conversation_id")
+                        if role == "device" and not conv_id:
+                            fresh = time.time() - room.last_activity < SESSION_REUSE_SECONDS
+                            conv_id = room.active_conversation if fresh else None
+                        
+                        await start_turn(room, source="voice", conversation_id=conv_id,
+                                         audio=(bytes(pending_audio), mime))
+                        pending_audio.clear()
 
                 elif kind == "text" and role == "client":
                     text = (data.get("text") or "").strip()
@@ -725,17 +744,9 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
                 elif kind == "ping":
                     await ws.send_text(json.dumps({"type": "pong"}))
 
-            # ---- binary frames (one complete utterance) ---------------------
+            # ---- binary frames (audio chunks) ---------------------
             elif msg.get("bytes"):
-                meta, pending_meta = pending_meta or {}, None
-                default_mime = "audio/pcm" if role == "device" else "audio/webm"
-                mime = meta.get("mime", default_mime)
-                conv_id = meta.get("conversation_id")
-                if role == "device" and not conv_id:
-                    fresh = time.time() - room.last_activity < SESSION_REUSE_SECONDS
-                    conv_id = room.active_conversation if fresh else None
-                await start_turn(room, source="voice", conversation_id=conv_id,
-                                 audio=(msg["bytes"], mime))
+                pending_audio.extend(msg["bytes"])
 
     except Exception:
         log.exception("WebSocket error in room %s", device_id)
