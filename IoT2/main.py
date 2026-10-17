@@ -677,8 +677,7 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
     await room.to_clients({"type": "presence", "device_online": bool(room.devices)})
     
     if role == "device":
-        await start_turn(room, source="system", text="The smart speaker just powered on. Say a short, friendly 1-sentence greeting so the user knows you are online and ready.")
-    
+        await room.to_devices({"type": "message", "role": "system", "text": "Hardware Online. Battery stable and ready to record."})
     pending_meta: Optional[dict] = None
     pending_audio = bytearray()
     
