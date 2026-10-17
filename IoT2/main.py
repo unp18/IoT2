@@ -82,6 +82,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3")
 TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AvaNeural")
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
+TURN_TIMEOUT = int(os.getenv("TURN_TIMEOUT", "120"))   # hard cap per turn so a stuck API call can never wedge the room
 SESSION_REUSE_SECONDS = 30 * 60   # device voice turns continue the last chat if recent
 
 SAMPLE_RATE = 16000
@@ -583,19 +584,23 @@ async def process_utterance(room: Room, text: str, source: str, conversation_id:
 async def run_turn(room: Room, source: str, conversation_id: Optional[str],
                    text: Optional[str] = None, audio: Optional[tuple[bytes, str]] = None):
     try:
-        if audio is not None:
-            await set_status(room, "transcribing")
-            text = await transcribe(*audio)
-            if not text:
-                await room.to_clients({"type": "info", "text": "Didn't catch that."})
-                return
-        if text:
-            await process_utterance(room, text, source, conversation_id)
+        async with asyncio.timeout(TURN_TIMEOUT):
+            if audio is not None:
+                await set_status(room, "transcribing")
+                text = await transcribe(*audio)
+                if not text:
+                    await room.to_clients({"type": "info", "text": "Didn't catch that."})
+                    return
+            if text:
+                await process_utterance(room, text, source, conversation_id)
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except TimeoutError:
+        log.error("Turn timed out after %ss", TURN_TIMEOUT)
+        await room.to_clients({"type": "error", "text": "That took too long and was cancelled."})
+    except Exception as e:
         log.exception("Turn failed")
-        await room.to_clients({"type": "error", "text": "Sorry, something went wrong."})
+        await room.to_clients({"type": "error", "text": f"Something went wrong ({type(e).__name__}). Check the server logs."})
     finally:
         await set_status(room, "idle")
 
