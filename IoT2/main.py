@@ -691,6 +691,14 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
             "type": "message", "role": "assistant", "id": msg["id"], "text": greeting,
             "conversation_id": conv["id"], "source": "system", "created_at": msg["created_at"]
         })
+
+    # 3. Generate TTS audio and stream it to the active audio target
+        if room.audio_targets():
+            queue = asyncio.Queue()
+            speaker_task = asyncio.create_task(speaker(room, queue))
+            await queue.put(greeting)
+            await queue.put(None)
+            await speaker_task
     pending_meta: Optional[dict] = None
     pending_audio = bytearray()
     
