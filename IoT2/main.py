@@ -592,6 +592,11 @@ async def run_turn(room: Room, source: str, conversation_id: Optional[str],
                     await room.to_clients({"type": "info", "text": "Didn't catch that."})
                     return
             if text:
+                # NEW: Hardware voice command interceptor
+                if "reset wifi" in text.lower() or "reset wi-fi" in text.lower():
+                    await room.to_devices({"type": "command", "action": "reset_wifi"})
+                    await room.to_clients({"type": "info", "text": "Command sent: Resetting device WiFi."})
+                    return # Stop processing, do not send to LLM
                 await process_utterance(room, text, source, conversation_id)
     except asyncio.CancelledError:
         raise
