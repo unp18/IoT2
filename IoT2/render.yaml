@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: smart-speaker
+    runtime: docker
+    region: singapore          # closest Render region to India
+    plan: starter              # $7/mo, always on. Persistent disks need a paid plan.
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: speaker-data
+      mountPath: /data         # SQLite lives here and survives restarts/deploys
+      sizeGB: 1
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false            # you'll be prompted for it in the dashboard
+      - key: DEVICE_TOKEN
+        generateValue: true    # random secret; copy it into your ESP32 firmware
+      - key: CLIENT_TOKEN
+        sync: false            # optional: leave blank to skip frontend auth
+      - key: DATABASE_URL
+        value: sqlite:////data/chat_history.db
+
+# Free-tier variant: change `plan` to `free` and delete the whole `disk:` block.
+# The service sleeps after 15 min idle and chat history resets on every restart.

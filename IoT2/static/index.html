@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Speaker</title>
+<style>
+:root{
+  --bg:#E8ECEF;--panel:#F6F8F9;--surface:#fff;--ink:#17212B;--muted:#667585;--line:#D5DCE2;
+  --accent:#1D6B73;--accent-ink:#fff;--user:#DCEBEC;--danger:#B3382C;--ok:#2E9F6B;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#12181D;--panel:#182027;--surface:#1E2830;--ink:#E6ECF0;--muted:#8D9CAA;--line:#2B3742;
+  --accent:#4DB3BD;--accent-ink:#06262A;--user:#21424A;--danger:#E27B6E;--ok:#4CC88F;color-scheme:dark;
+}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);
+  padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.app{display:grid;grid-template-columns:280px 1fr;height:100%}
+
+/* sidebar */
+aside{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.side-top{padding:14px;display:flex;gap:8px}
+.new{flex:1;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--surface);text-align:left;font-weight:600}
+.new:hover{border-color:var(--accent)}
+.list{flex:1;overflow-y:auto;padding:0 8px 12px}
+.conv{display:flex;align-items:center;gap:4px;padding:8px 8px 8px 12px;border-radius:8px;cursor:pointer}
+.conv:hover,.conv.active{background:var(--surface)}
+.conv.active{box-shadow:inset 3px 0 0 var(--accent)}
+.conv .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conv .acts{display:none;gap:2px}
+.conv:hover .acts,.conv:focus-within .acts{display:flex}
+.ic{border:0;background:none;padding:4px;border-radius:6px;color:var(--muted);line-height:0}
+.ic:hover{color:var(--ink);background:var(--bg)}
+.empty-list{color:var(--muted);padding:12px;font-size:14px}
+
+/* main */
+main{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--surface)}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.burger{display:none}
+.title{font-weight:650;flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dev{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+.dot.on{background:var(--ok)}
+.seg{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.seg button{border:0;background:none;padding:5px 11px;font-size:14px;color:var(--muted)}
+.seg button[aria-pressed=true]{background:var(--accent);color:var(--accent-ink)}
+
+#msgs{flex:1;overflow-y:auto;padding:24px 16px;display:flex;flex-direction:column;gap:18px}
+.msg{max-width:min(68ch,100%);width:fit-content}
+.msg.user{align-self:flex-end;background:var(--user);padding:9px 14px;border-radius:16px 16px 4px 16px}
+.msg.assistant{align-self:flex-start}
+.msg .text{white-space:pre-wrap;overflow-wrap:anywhere}
+.msg.streaming .text::after{content:"\258D";color:var(--accent)}
+.msg .mic{display:inline-block;vertical-align:-2px;margin-right:6px;color:var(--muted)}
+.note{align-self:center;color:var(--muted);font-size:14px}
+.note.err{color:var(--danger)}
+.hello{margin:auto;text-align:center;color:var(--muted);max-width:32ch}
+.hello strong{display:block;color:var(--ink);font-size:20px;margin-bottom:6px}
+
+/* composer */
+.composer{padding:10px 16px 16px;border-top:1px solid var(--line)}
+.state{height:22px;font-size:14px;color:var(--muted);margin-bottom:4px}
+.state.live{color:var(--accent)}
+.row{display:flex;gap:10px;align-items:flex-end}
+textarea{flex:1;resize:none;max-height:140px;padding:11px 14px;border-radius:14px;border:1px solid var(--line);
+  background:var(--bg);color:var(--ink);font:inherit;line-height:1.4}
+textarea:focus{outline:2px solid var(--accent);outline-offset:0}
+.btn{width:46px;height:46px;border-radius:50%;border:0;background:var(--accent);color:var(--accent-ink);
+  display:grid;place-items:center;flex:none}
+.btn.stop{background:var(--danger);color:#fff}
+.btn:disabled{opacity:.45;cursor:default}
+
+/* hold-to-talk: the ring grows with your voice level */
+#mic{--level:0;position:relative;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
+  background:var(--surface);color:var(--accent);border:2px solid var(--accent);
+  box-shadow:0 0 0 calc(var(--level)*14px) color-mix(in srgb,var(--accent) 28%,transparent)}
+#mic.rec{background:var(--accent);color:var(--accent-ink)}
+
+dialog{border:1px solid var(--line);border-radius:14px;background:var(--surface);color:var(--ink);padding:20px;width:min(400px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.4)}
+dialog label{display:block;font-size:14px;color:var(--muted);margin-top:12px}
+dialog input{width:100%;padding:9px 11px;margin-top:4px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit}
+.dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+.pill{padding:8px 16px;border-radius:9px;border:1px solid var(--line);background:none}
+.pill.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+#toast{position:fixed;left:50%;bottom:calc(90px + env(safe-area-inset-bottom,0));transform:translateX(-50%);background:var(--ink);
+  color:var(--surface);padding:8px 14px;border-radius:10px;font-size:14px;max-width:90vw;opacity:0;pointer-events:none;transition:opacity .15s}
+#toast.show{opacity:1}
+
+@media (max-width:760px){
+  .app{grid-template-columns:1fr}
+  aside{position:fixed;inset:0 20% 0 0;z-index:5;transform:translateX(-100%);transition:transform .2s;padding-top:env(safe-area-inset-top,0)}
+  body.nav aside{transform:none;box-shadow:0 0 40px rgba(0,0,0,.35)}
+  .burger{display:block}
+  .conv .acts{display:flex}
+}
+@media (prefers-reduced-motion:reduce){aside,#toast{transition:none}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside aria-label="Conversations">
+    <div class="side-top">
+      <button class="new" id="newChat">New chat</button>
+      <button class="ic" id="settingsBtn" aria-label="Settings" title="Settings">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+    </div>
+    <div class="list" id="list"></div>
+  </aside>
+
+  <main>
+    <header>
+      <button class="ic burger" id="burger" aria-label="Show conversations">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <div class="title" id="title">New chat</div>
+      <div class="dev"><span class="dot" id="dot"></span><span id="devText">Connecting…</span></div>
+      <div class="seg" role="group" aria-label="Play replies on">
+        <button id="outDevice" aria-pressed="true">Speaker</button>
+        <button id="outClient" aria-pressed="false">This phone</button>
+      </div>
+    </header>
+
+    <div id="msgs" aria-live="polite"></div>
+
+    <div class="composer">
+      <div class="state" id="state"></div>
+      <div class="row">
+        <button class="btn" id="mic" aria-label="Hold to talk" title="Hold to talk">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+        </button>
+        <textarea id="input" rows="1" placeholder="Type a message, or hold the mic to talk"></textarea>
+        <button class="btn" id="send" aria-label="Send">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
+        <button class="btn stop" id="stop" aria-label="Stop" hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+        </button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<dialog id="dlg">
+  <strong>Connection</strong>
+  <label>Server URL <input id="cfgServer" placeholder="Leave blank to use this page’s address" autocomplete="off"></label>
+  <label>Speaker ID <input id="cfgDevice" autocomplete="off"></label>
+  <label>Access token (if set on the server) <input id="cfgToken" type="password" autocomplete="off"></label>
+  <div class="dlg-actions">
+    <button class="pill" id="cfgCancel">Cancel</button>
+    <button class="pill primary" id="cfgSave">Save</button>
+  </div>
+</dialog>
+<div id="toast" role="status"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const store = {
+  get(k, d){ try { return localStorage.getItem(k) ?? d } catch { return d } },
+  set(k, v){ try { localStorage.setItem(k, v) } catch {} }
+};
+const cfg = { server: store.get('server',''), device: store.get('device','living-room'), token: store.get('token','') };
+
+const S = { ws:null, retry:0, conv:null, awaitingNew:false, stream:null, output:'device',
+            online:false, status:'idle', connected:false, convs:[] };
+
+const base = () => cfg.server ? cfg.server.replace(/\/$/,'') :
+  (location.protocol.startsWith('http') ? location.origin : 'http://localhost:8000');
+
+async function api(path, opts = {}){
+  const r = await fetch(base() + path, { ...opts,
+    headers: { 'Content-Type':'application/json', 'X-Token': cfg.token, ...(opts.headers||{}) } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+function toast(text){
+  const t = $('#toast'); t.textContent = text; t.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+/* ---------- WebSocket ---------- */
+function connect(){
+  clearTimeout(S.retry);
+  if (S.ws){ S.ws.onclose = null; S.ws.close(); }
+  const url = base().replace(/^http/, 'ws') +
+    `/ws/${encodeURIComponent(cfg.device)}?role=client&token=${encodeURIComponent(cfg.token)}`;
+  const ws = S.ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { S.connected = true; renderDevice(); };
+  ws.onclose = () => { S.connected = false; S.online = false; renderDevice(); renderState();
+                       S.retry = setTimeout(connect, 2000); };
+  ws.onmessage = e => typeof e.data === 'string' ? onEvent(JSON.parse(e.data)) : playChunk(e.data);
+}
+const send = obj => S.ws && S.ws.readyState === 1 && S.ws.send(JSON.stringify(obj));
+
+function onEvent(m){
+  switch (m.type){
+    case 'hello':
+      S.online = m.device_online; S.output = m.output; S.status = m.status;
+      if (m.telemetry) setTelemetry(m.telemetry);
+      renderDevice(); renderOutput(); renderState(); break;
+    case 'presence': S.online = m.device_online; renderDevice(); break;
+    case 'telemetry': setTelemetry(m); renderDevice(); break;
+    case 'output': S.output = m.output; renderOutput(); renderState(); break;
+    case 'status': S.status = m.status; renderState(); break;
+    case 'conversation':
+      if (!S.conv && S.awaitingNew){ S.conv = m.conversation.id; S.awaitingNew = false; }
+      if (m.conversation.id === S.conv) $('#title').textContent = m.conversation.title;
+      loadConvs(); break;
+    case 'message':
+      if (m.conversation_id !== S.conv) break;
+      if (m.role === 'assistant' && S.stream){
+        S.stream.querySelector('.text').textContent = m.text;
+        S.stream.classList.remove('streaming'); S.stream = null;
+      } else addMsg(m.role, m.text, m.source);
+      break;
+    case 'message_start':
+      if (m.conversation_id === S.conv) S.stream = addMsg('assistant', '', null, true); break;
+    case 'token':
+      if (S.stream && m.conversation_id === S.conv){
+        const t = S.stream.querySelector('.text'); t.textContent += m.text; scrollDown(); }
+      break;
+    case 'stop': stopPlayback(); endStream(); break;
+    case 'info': addNote(m.text); break;
+    case 'warning': addNote(m.text); break;
+    case 'error': endStream(); addNote(m.text, true); break;
+  }
+}
+function endStream(){ if (S.stream){ S.stream.classList.remove('streaming'); S.stream = null; } }
+
+/* ---------- Rendering ---------- */
+let telemetry = { temp:null, hum:null };
+const setTelemetry = t => telemetry = { temp:t.temp, hum:t.hum };
+
+function renderDevice(){
+  $('#dot').classList.toggle('on', S.online);
+  let text = !S.connected ? 'Reconnecting…' : S.online ? 'Speaker online' : 'Speaker offline';
+  if (S.online && telemetry.temp != null) text += `, ${telemetry.temp} °C, ${telemetry.hum}% humidity`;
+  $('#devText').textContent = text;
+}
+function renderOutput(){
+  $('#outDevice').setAttribute('aria-pressed', S.output === 'device');
+  $('#outClient').setAttribute('aria-pressed', S.output === 'client');
+}
+function renderState(){
+  const el = $('#state'), busy = S.status !== 'idle';
+  const where = S.output === 'device' ? 'on the speaker' : 'on this phone';
+  el.textContent = { idle:'', transcribing:'Transcribing…', thinking:'Thinking…', speaking:`Speaking ${where}` }[S.status] || '';
+  el.classList.toggle('live', busy);
+  $('#stop').hidden = !busy; $('#send').hidden = busy;
+}
+
+const msgs = $('#msgs');
+function scrollDown(force){
+  if (force || msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 160) msgs.scrollTop = msgs.scrollHeight;
+}
+function clearHello(){ const h = msgs.querySelector('.hello'); if (h) h.remove(); }
+function addMsg(role, text, source, streaming){
+  clearHello();
+  const d = document.createElement('div');
+  d.className = 'msg ' + role + (streaming ? ' streaming' : '');
+  if (role === 'user' && source === 'voice'){
+    d.insertAdjacentHTML('beforeend', '<svg class="mic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/></svg>');
+  }
+  const t = document.createElement('span'); t.className = 'text'; t.textContent = text;
+  d.append(t); msgs.append(d); scrollDown(true); return d;
+}
+function addNote(text, err){
+  const n = document.createElement('div'); n.className = 'note' + (err ? ' err' : ''); n.textContent = text;
+  msgs.append(n); scrollDown();
+}
+function showEmpty(){
+  msgs.innerHTML = '<div class="hello"><strong>Ask your speaker anything</strong>Type below, or hold the mic and speak. Replies play on the device you pick above.</div>';
+}
+
+/* ---------- Conversations ---------- */
+async function loadConvs(){
+  try { S.convs = await api('/api/conversations?device_id=' + encodeURIComponent(cfg.device)); }
+  catch { return; }
+  const list = $('#list'); list.innerHTML = '';
+  if (!S.convs.length){ list.innerHTML = '<div class="empty-list">No chats yet.</div>'; return; }
+  for (const c of S.convs){
+    const row = document.createElement('div');
+    row.className = 'conv' + (c.id === S.conv ? ' active' : '');
+    row.tabIndex = 0;
+    row.innerHTML = '<span class="t"></span><span class="acts">' +
+      '<button class="ic" data-a="rename" aria-label="Rename chat"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>' +
+      '<button class="ic" data-a="delete" aria-label="Delete chat"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button></span>';
+    row.querySelector('.t').textContent = c.title;
+    row.onclick = async e => {
+      const a = e.target.closest('[data-a]')?.dataset.a;
+      if (a === 'rename'){
+        const t = prompt('Rename chat', c.title);
+        if (t && t.trim()){ await api('/api/conversations/' + c.id, { method:'PATCH', body: JSON.stringify({ title:t }) });
+          if (c.id === S.conv) $('#title').textContent = t.trim(); loadConvs(); }
+      } else if (a === 'delete'){
+        if (confirm('Delete this chat?')){ await api('/api/conversations/' + c.id, { method:'DELETE' });
+          if (c.id === S.conv) newChat(); loadConvs(); }
+      } else openConv(c.id);
+    };
+    row.onkeydown = e => { if (e.key === 'Enter' && e.target === row) openConv(c.id); };
+    list.append(row);
+  }
+}
+async function openConv(id){
+  document.body.classList.remove('nav');
+  try {
+    const c = await api('/api/conversations/' + id);
+    S.conv = id; S.awaitingNew = false; S.stream = null;
+    $('#title').textContent = c.title; msgs.innerHTML = '';
+    c.messages.forEach(m => addMsg(m.role, m.text, m.source));
+    if (!c.messages.length) showEmpty();
+    scrollDown(true); loadConvs();
+  } catch { toast('Couldn’t load that chat'); }
+}
+function newChat(){
+  S.conv = null; S.awaitingNew = false; S.stream = null;
+  $('#title').textContent = 'New chat'; showEmpty();
+  document.body.classList.remove('nav'); loadConvs();
+}
+
+/* ---------- Sending text ---------- */
+const input = $('#input');
+function sendText(){
+  const text = input.value.trim();
+  if (!text || S.status !== 'idle') return;
+  unlockAudio();
+  if (!S.conv) S.awaitingNew = true;
+  send({ type:'text', text, conversation_id:S.conv });
+  input.value = ''; input.style.height = 'auto';
+}
+input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = input.scrollHeight + 'px'; });
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); } });
+$('#send').onclick = sendText;
+$('#stop').onclick = () => send({ type:'stop' });
+
+/* ---------- Hold to talk ---------- */
+let actx, micStream, rec, chunks = [], holding = false, startedAt = 0, meter = 0;
+function unlockAudio(){ actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); }
+
+async function micStart(e){
+  e.preventDefault();
+  if (S.status !== 'idle') return;
+  holding = true; unlockAudio();
+  if (!navigator.mediaDevices || !window.MediaRecorder){
+    holding = false; return toast('The microphone needs a secure (https) connection'); }
+  try {
+    micStream = micStream || await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true } });
+  } catch { holding = false; return toast('Microphone permission was denied'); }
+  if (!holding) return;                                    // released while the permission prompt was open
+  const mime = ['audio/webm;codecs=opus','audio/mp4','audio/webm'].find(m => MediaRecorder.isTypeSupported(m));
+  rec = new MediaRecorder(micStream, mime ? { mimeType:mime } : undefined);
+  chunks = [];
+  rec.ondataavailable = ev => ev.data.size && chunks.push(ev.data);
+  rec.onstop = onRecStop;
+  rec.start(); startedAt = Date.now();
+  $('#mic').classList.add('rec'); $('#state').textContent = 'Listening…'; $('#state').classList.add('live');
+
+  const src = actx.createMediaStreamSource(micStream), an = actx.createAnalyser();
+  an.fftSize = 512; src.connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  (function tick(){
+    an.getByteTimeDomainData(buf);
+    let sum = 0; for (const v of buf){ const x = (v - 128) / 128; sum += x * x; }
+    $('#mic').style.setProperty('--level', Math.min(1, Math.sqrt(sum / buf.length) * 4));
+    meter = holding ? requestAnimationFrame(tick) : 0;
+    if (!holding) src.disconnect();
+  })();
+}
+function micStop(){
+  holding = false;
+  if (rec && rec.state === 'recording') rec.stop();
+}
+async function onRecStop(){
+  cancelAnimationFrame(meter);
+  $('#mic').classList.remove('rec'); $('#mic').style.setProperty('--level', 0);
+  renderState();
+  if (Date.now() - startedAt < 500){ return toast('Hold the mic while you speak'); }
+  const mime = rec.mimeType || 'audio/webm';
+  const blob = new Blob(chunks, { type:mime });
+  if (!S.conv) S.awaitingNew = true;
+  send({ type:'audio_meta', mime, conversation_id:S.conv });
+  S.ws.send(await blob.arrayBuffer());
+}
+const mic = $('#mic');
+mic.addEventListener('pointerdown', micStart);
+['pointerup','pointercancel'].forEach(t => mic.addEventListener(t, micStop));
+mic.addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------- Playing replies on this phone (raw 16 kHz PCM) ---------- */
+let nextTime = 0, playing = [];
+function playChunk(buf){
+  if (S.output !== 'client') return;
+  unlockAudio();
+  const i16 = new Int16Array(buf, 0, Math.floor(buf.byteLength / 2));
+  const ab = actx.createBuffer(1, i16.length, 16000), ch = ab.getChannelData(0);
+  for (let i = 0; i < i16.length; i++) ch[i] = i16[i] / 32768;
+  const src = actx.createBufferSource(); src.buffer = ab; src.connect(actx.destination);
+  nextTime = Math.max(nextTime, actx.currentTime + 0.08);
+  src.start(nextTime); nextTime += ab.duration;
+  playing.push(src); src.onended = () => playing = playing.filter(s => s !== src);
+}
+function stopPlayback(){ playing.forEach(s => { try { s.stop() } catch {} }); playing = []; nextTime = 0; }
+
+/* ---------- Output selector, settings, layout ---------- */
+$('#outDevice').onclick = () => send({ type:'set_output', output:'device' });
+$('#outClient').onclick = () => { unlockAudio(); send({ type:'set_output', output:'client' }); };
+$('#newChat').onclick = newChat;
+$('#burger').onclick = () => document.body.classList.toggle('nav');
+msgs.onclick = () => document.body.classList.remove('nav');
+
+const dlg = $('#dlg');
+$('#settingsBtn').onclick = () => {
+  $('#cfgServer').value = cfg.server; $('#cfgDevice').value = cfg.device; $('#cfgToken').value = cfg.token; dlg.showModal();
+};
+$('#cfgCancel').onclick = () => dlg.close();
+$('#cfgSave').onclick = () => {
+  cfg.server = $('#cfgServer').value.trim(); cfg.device = $('#cfgDevice').value.trim() || 'living-room'; cfg.token = $('#cfgToken').value;
+  store.set('server', cfg.server); store.set('device', cfg.device); store.set('token', cfg.token);
+  dlg.close(); newChat(); connect();
+};
+
+showEmpty(); renderDevice(); renderOutput(); renderState(); loadConvs(); connect();
+</script>
+</body>
+</html>
