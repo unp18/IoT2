@@ -670,7 +670,8 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
         "telemetry": {"temp": room.telemetry["temp"], "hum": room.telemetry["hum"]},
     }))
     await room.to_clients({"type": "presence", "device_online": bool(room.devices)})
-
+    if role == "device":
+        await start_turn(room, source="system", text="The smart speaker just powered on. Say a short, friendly 1-sentence greeting so the user knows you are online and ready.")
     pending_meta: Optional[dict] = None
     try:
         while True:
