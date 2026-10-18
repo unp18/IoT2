@@ -1,25 +1,20 @@
 """
 IoT Smart Speaker backend
-
+IoT Smart Speaker backend (PostgreSQL Version)
 Pipeline:  audio/text in -> Whisper (Groq) -> LLM (Groq, streaming, tools)
            -> sentence-level edge-tts -> ffmpeg -> 16 kHz/16-bit/mono PCM -> ESP32
-
 WebSocket:  /ws/{device_id}?role=device|client&token=...
-
 Client -> server (JSON text frames)
   {"type":"text","text":"...","conversation_id":"<optional>"}
   {"type":"audio_meta","mime":"audio/webm","conversation_id":"<optional>"}   then ONE binary frame
   {"type":"set_output","output":"device"|"client"}
   {"type":"stop"}
   {"type":"ping"}
-
 Device -> server
   {"type":"telemetry","temp":24.1,"hum":55}
   {"type":"audio_meta","mime":"audio/pcm"}  then ONE binary frame of raw PCM (future mic)
-
 Server -> everyone
   {"type":"status","state":"idle|transcribing|thinking|speaking"}
-
 Server -> clients
   {"type":"hello", ...}              {"type":"presence","device_online":bool}
   {"type":"conversation","conversation":{id,title}}
@@ -28,7 +23,6 @@ Server -> clients
   {"type":"token","conversation_id","text"}
   {"type":"telemetry","temp","hum"}  {"type":"output","output":"device|client"}
   {"type":"info"|"error"|"warning","text":"..."}
-
 Server -> audio target (device or client, depending on set_output)
   {"type":"audio_start","rate":16000,"bits":16,"ch":1}
   <binary PCM chunks, 4096 bytes each>
@@ -74,7 +68,8 @@ log = logging.getLogger("speaker")
 # Config
 # -----------------------------------------------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chat_history.db")
+# Default updated to PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/speaker_db")
 DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "")          # required for role=device
 CLIENT_TOKEN = os.getenv("CLIENT_TOKEN", "")          # optional for role=client / REST
 FRONTEND_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
@@ -114,20 +109,18 @@ groq = AsyncGroq(api_key=GROQ_API_KEY)
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def new_id() -> str:
     return uuid.uuid4().hex
 
-
 def iso(dt: datetime) -> str:
-    if dt.tzinfo is None:               # SQLite returns naive datetimes (stored as UTC)
+    # PostgreSQL with SQLAlchemy DateTime(timezone=True) natively returns timezone-aware datetimes.
+    # This fallback is kept just in case naive objects are ever passed locally.
+    if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat()
 
-
 class Base(DeclarativeBase):
     pass
-
 
 class Conversation(Base):
     __tablename__ = "conversations"
@@ -140,7 +133,6 @@ class Conversation(Base):
         back_populates="conversation", cascade="all, delete-orphan"
     )
 
-
 class Message(Base):
     __tablename__ = "messages"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
@@ -151,7 +143,6 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
-
 class SensorLog(Base):
     __tablename__ = "sensor_logs"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -160,14 +151,15 @@ class SensorLog(Base):
     humidity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-
+# Configure PostgreSQL Engine with connection pooling
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    pool_size=10,          # Standard pool size for PG
+    max_overflow=20,       # Allow up to 20 extra connections during spikes
+    pool_pre_ping=True     # Ensure connections aren't stale before using them
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 Base.metadata.create_all(bind=engine)
-
 
 def get_db():
     db = SessionLocal()
@@ -176,18 +168,15 @@ def get_db():
     finally:
         db.close()
 
-
 def _run_db(fn, *args, **kwargs):
     with SessionLocal() as db:
         result = fn(db, *args, **kwargs)
         db.commit()
         return result
 
-
 async def adb(fn, *args, **kwargs):
     """Run a sync DB function in a worker thread so the event loop never blocks."""
     return await asyncio.to_thread(_run_db, fn, *args, **kwargs)
-
 
 def db_ensure_conversation(db: Session, device_id: str, conversation_id: Optional[str]) -> dict:
     conv = db.get(Conversation, conversation_id) if conversation_id else None
@@ -196,7 +185,6 @@ def db_ensure_conversation(db: Session, device_id: str, conversation_id: Optiona
         db.add(conv)
         db.flush()
     return {"id": conv.id, "title": conv.title}
-
 
 def db_add_message(db: Session, conversation_id: str, role: str, content: str, source: str) -> dict:
     msg = Message(id=new_id(), conversation_id=conversation_id, role=role, content=content, source=source)
@@ -208,7 +196,6 @@ def db_add_message(db: Session, conversation_id: str, role: str, content: str, s
     db.flush()
     return {"id": msg.id, "created_at": iso(msg.created_at), "title": conv.title}
 
-
 def db_history(db: Session, conversation_id: str, limit: int) -> list[dict]:
     rows = db.scalars(
         select(Message)
@@ -217,7 +204,6 @@ def db_history(db: Session, conversation_id: str, limit: int) -> list[dict]:
         .limit(limit)
     ).all()
     return [{"role": m.role, "content": m.content} for m in reversed(rows)]
-
 
 def db_log_sensor(db: Session, device_id: str, temp, hum):
     db.add(SensorLog(device_id=device_id, temperature=temp, humidity=hum))
@@ -282,11 +268,9 @@ class Manager:
 
 manager = Manager()
 
-
 async def set_status(room: Room, state: str):
     room.status = state
     await room.to_everyone({"type": "status", "state": state})
-
 
 # -----------------------------------------------------------------------------
 # Tools
@@ -302,7 +286,6 @@ TOOLS = [
     }
 ]
 
-
 def run_tool(room: Room, name: str) -> str:
     if name == "get_dht_sensor_data":
         t = room.telemetry
@@ -316,7 +299,6 @@ def run_tool(room: Room, name: str) -> str:
             }
         )
     return json.dumps({"error": f"Unknown tool {name}"})
-
 
 # -----------------------------------------------------------------------------
 # Audio helpers: STT / TTS / PCM
@@ -332,7 +314,6 @@ MIME_EXT = {
     "audio/x-wav": "wav",
 }
 
-
 def pcm_to_wav(pcm: bytes) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -341,7 +322,6 @@ def pcm_to_wav(pcm: bytes) -> bytes:
         w.setframerate(SAMPLE_RATE)
         w.writeframes(pcm)
     return buf.getvalue()
-
 
 async def transcribe(audio: bytes, mime: str) -> str:
     mime = (mime or "audio/webm").split(";")[0].strip().lower()
@@ -359,13 +339,11 @@ async def transcribe(audio: bytes, mime: str) -> str:
     norm = re.sub(r"[^\w\s]", "", text.lower()).strip()
     return "" if norm in HALLUCINATIONS else text
 
-
 def clean_for_speech(text: str) -> str:
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[*_`#>~|]", "", text)
     return re.sub(r"\s+", " ", text).strip()
-
 
 async def mp3_to_pcm(mp3: bytes) -> bytes:
     proc = await asyncio.create_subprocess_exec(
@@ -380,7 +358,6 @@ async def mp3_to_pcm(mp3: bytes) -> bytes:
         raise RuntimeError(f"ffmpeg failed: {err.decode(errors='ignore')[:200]}")
     return pcm
 
-
 async def synthesize(text: str) -> bytes:
     text = clean_for_speech(text)
     if not text:
@@ -391,10 +368,8 @@ async def synthesize(text: str) -> bytes:
             mp3.extend(chunk["data"])
     return await mp3_to_pcm(bytes(mp3)) if mp3 else b""
 
-
 class Pacer:
     """Keeps us at most LEAD_SECONDS ahead of real-time playback so the ESP32 ring buffer never overflows."""
-
     def __init__(self):
         self.t0: Optional[float] = None
         self.sent = 0.0
@@ -408,10 +383,8 @@ class Pacer:
         if ahead > LEAD_SECONDS:
             await asyncio.sleep(ahead - LEAD_SECONDS)
 
-
 class SentenceSplitter:
     """Turns a token stream into speakable sentences."""
-
     END = re.compile(r"(?<=[.!?])\s+|\n+")
     MIN_CHARS = 20
 
@@ -432,7 +405,6 @@ class SentenceSplitter:
     def flush(self) -> list[str]:
         rest, self.buf = self.buf.strip(), ""
         return [rest] if rest else []
-
 
 # -----------------------------------------------------------------------------
 # Conversation pipeline
@@ -465,7 +437,6 @@ async def speaker(room: Room, queue: asyncio.Queue):
                 await pacer.wait(len(chunk))
     if started:
         await room.to_audio_target({"type": "audio_end"})
-
 
 async def run_llm(room: Room, conversation_id: str, history: list[dict],
                   queue: Optional[asyncio.Queue], partial: dict) -> str:
@@ -529,7 +500,6 @@ async def run_llm(room: Room, conversation_id: str, history: list[dict],
             await queue.put(sentence)
     return partial["text"].strip()
 
-
 async def process_utterance(room: Room, text: str, source: str, conversation_id: Optional[str]):
     conv = await adb(db_ensure_conversation, room.device_id, conversation_id)
     conv_id = conv["id"]
@@ -592,11 +562,10 @@ async def run_turn(room: Room, source: str, conversation_id: Optional[str],
                     await room.to_clients({"type": "info", "text": "Didn't catch that."})
                     return
             if text:
-                # NEW: Hardware voice command interceptor
                 if "reset wifi" in text.lower() or "reset wi-fi" in text.lower():
                     await room.to_devices({"type": "command", "action": "reset_wifi"})
                     await room.to_clients({"type": "info", "text": "Command sent: Resetting device WiFi."})
-                    return # Stop processing, do not send to LLM
+                    return 
                 await process_utterance(room, text, source, conversation_id)
     except asyncio.CancelledError:
         raise
@@ -608,7 +577,6 @@ async def run_turn(room: Room, source: str, conversation_id: Optional[str],
         await room.to_clients({"type": "error", "text": f"Something went wrong ({type(e).__name__}). Check the server logs."})
     finally:
         await set_status(room, "idle")
-
 
 async def cancel_turn(room: Room):
     """Cancel the running turn and tell the audio target to flush playback."""
@@ -622,11 +590,9 @@ async def cancel_turn(room: Room):
         await room.to_devices({"type": "stop"})
         await room.to_clients({"type": "stop"})
 
-
 async def start_turn(room: Room, **kwargs):
     await cancel_turn(room)
     room.task = asyncio.create_task(run_turn(room, **kwargs))
-
 
 # -----------------------------------------------------------------------------
 # App
@@ -640,17 +606,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def token_ok(expected: str, given: str, required: bool) -> bool:
     if not expected:
         return not required
     return hmac.compare_digest(expected, given or "")
 
-
 def require_client(x_token: str = Header(default="")):
     if not token_ok(CLIENT_TOKEN, x_token, required=False):
         raise HTTPException(status_code=401, detail="Invalid token")
-
 
 @app.websocket("/ws/{device_id}")
 async def ws_endpoint(ws: WebSocket, device_id: str,
@@ -678,11 +641,8 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
     
     if role == "device":
         greeting = "Hi there! I'm powered up, connected, and ready to chat. What's on your mind?"
-    
-    # 1. Send lightweight text to ESP32 Serial Monitor
         await room.to_devices({"type": "message", "role": "system", "text": greeting})
     
-    # 2. Save it to the database and send to the webapp as a chat message
         conv = await adb(db_ensure_conversation, device_id, room.active_conversation)
         room.active_conversation = conv["id"]
         msg = await adb(db_add_message, conv["id"], "assistant", greeting, "system")
@@ -692,7 +652,6 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
             "conversation_id": conv["id"], "source": "system", "created_at": msg["created_at"]
         })
 
-    # 3. Generate TTS audio and stream it to the active audio target
         if room.audio_targets():
             queue = asyncio.Queue()
             speaker_task = asyncio.create_task(speaker(room, queue))
@@ -779,7 +738,6 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
         if not room.devices and not room.clients:
             await cancel_turn(room)
 
-
 # -----------------------------------------------------------------------------
 # REST API (powers the chat sidebar / history)
 # -----------------------------------------------------------------------------
@@ -787,20 +745,16 @@ class ConversationCreate(BaseModel):
     device_id: str
     title: Optional[str] = None
 
-
 class ConversationRename(BaseModel):
     title: str
-
 
 def conv_dict(c: Conversation) -> dict:
     return {"id": c.id, "device_id": c.device_id, "title": c.title,
             "created_at": iso(c.created_at), "updated_at": iso(c.updated_at)}
 
-
 @app.get("/api/health")
 def health():
     return {"status": "online"}
-
 
 @app.get("/api/devices/{device_id}", dependencies=[Depends(require_client)])
 def device_status(device_id: str):
@@ -808,7 +762,6 @@ def device_status(device_id: str):
     return {"device_id": device_id, "online": bool(room.devices), "output": room.output,
             "status": room.status,
             "telemetry": {"temp": room.telemetry["temp"], "hum": room.telemetry["hum"]}}
-
 
 @app.get("/api/conversations", dependencies=[Depends(require_client)])
 def list_conversations(device_id: str, limit: int = Query(50, le=200), db: Session = Depends(get_db)):
@@ -818,14 +771,12 @@ def list_conversations(device_id: str, limit: int = Query(50, le=200), db: Sessi
     ).all()
     return [conv_dict(c) for c in rows]
 
-
 @app.post("/api/conversations", dependencies=[Depends(require_client)])
 def create_conversation(body: ConversationCreate, db: Session = Depends(get_db)):
     conv = Conversation(id=new_id(), device_id=body.device_id, title=body.title or "New chat")
     db.add(conv)
     db.commit()
     return conv_dict(conv)
-
 
 @app.get("/api/conversations/{conversation_id}", dependencies=[Depends(require_client)])
 def get_conversation(conversation_id: str, limit: int = Query(50, le=200),
@@ -850,7 +801,6 @@ def get_conversation(conversation_id: str, limit: int = Query(50, le=200),
         "has_more": len(rows) == limit,
     }
 
-
 @app.patch("/api/conversations/{conversation_id}", dependencies=[Depends(require_client)])
 def rename_conversation(conversation_id: str, body: ConversationRename, db: Session = Depends(get_db)):
     conv = db.get(Conversation, conversation_id)
@@ -860,7 +810,6 @@ def rename_conversation(conversation_id: str, body: ConversationRename, db: Sess
     db.commit()
     return conv_dict(conv)
 
-
 @app.delete("/api/conversations/{conversation_id}", dependencies=[Depends(require_client)])
 def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
     conv = db.get(Conversation, conversation_id)
@@ -869,7 +818,6 @@ def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
     db.delete(conv)
     db.commit()
     return {"deleted": conversation_id}
-
 
 # -----------------------------------------------------------------------------
 # Frontend (served last so it never shadows /api or /ws)
