@@ -82,6 +82,25 @@ textarea:focus{outline:2px solid var(--accent);outline-offset:0}
   box-shadow:0 0 0 calc(var(--level)*14px) color-mix(in srgb,var(--accent) 28%,transparent)}
 #mic.rec{background:var(--accent);color:var(--accent-ink)}
 
+.alert{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--danger);color:#fff}
+.alert .msg-box{flex:1;min-width:0}
+.alert strong{display:block;letter-spacing:.02em}
+.alert button{border:2px solid #fff;background:none;color:#fff;border-radius:9px;padding:6px 14px;font-weight:600}
+.alert button:hover{background:rgba(255,255,255,.18)}
+.sensor{display:flex;align-items:center;gap:16px;padding:8px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.sensor .val{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.sensor .unit{color:var(--muted);font-size:14px}
+.sensor .hum{color:var(--muted);font-size:14px}
+#spark{flex:1;min-width:120px;max-width:320px;height:36px}
+#spark polyline{fill:none;stroke:var(--accent);stroke-width:2;vector-effect:non-scaling-stroke;stroke-linejoin:round}
+#spark.fire polyline{stroke:var(--danger)}
+.risk{display:flex;flex-direction:column;gap:3px;min-width:110px;font-size:13px;color:var(--muted)}
+.risk .bar{height:6px;border-radius:99px;background:var(--line);overflow:hidden}
+.risk .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
+.risk.hot .bar i{background:var(--danger)}
+.risk.hot{color:var(--danger);font-weight:600}
+.badge{font-size:13px;padding:3px 10px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
+.badge.fire{background:var(--danger);border-color:var(--danger);color:#fff;font-weight:700}
 dialog{border:1px solid var(--line);border-radius:14px;background:var(--surface);color:var(--ink);padding:20px;width:min(400px,92vw)}
 dialog::backdrop{background:rgba(0,0,0,.4)}
 dialog label{display:block;font-size:14px;color:var(--muted);margin-top:12px}
@@ -127,6 +146,19 @@ dialog input{width:100%;padding:9px 11px;margin-top:4px;border-radius:9px;border
         <button id="outClient" aria-pressed="false">This phone</button>
       </div>
     </header>
+
+    <div class="alert" id="alert" role="alert" hidden>
+      <div class="msg-box"><strong>FIRE ALERT</strong><span id="alertText"></span></div>
+      <button id="ackBtn">Acknowledge</button>
+    </div>
+
+    <div class="sensor" aria-label="Live sensor">
+      <div><span class="val" id="tNow">--</span> <span class="unit">°C</span></div>
+      <div class="hum" id="hNow"></div>
+      <svg id="spark" viewBox="0 0 160 36" preserveAspectRatio="none" aria-hidden="true"><polyline id="sparkLine" points=""/></svg>
+      <div class="risk" id="risk" title="Spike score from the trained model"><span id="riskLabel">Spike risk --</span><div class="bar"><i id="riskFill"></i></div></div>
+      <span class="badge" id="sBadge">Normal</span>
+    </div>
 
     <div id="msgs" aria-live="polite"></div>
 
@@ -211,9 +243,12 @@ function onEvent(m){
     case 'hello':
       S.online = m.device_online; S.output = m.output; S.status = m.status;
       if (m.telemetry) setTelemetry(m.telemetry);
-      renderDevice(); renderOutput(); renderState(); break;
+      if (m.alert) showAlert(m.alert, true); else hideAlert();
+      renderDevice(); renderOutput(); renderState(); renderSensor(!!m.alert); break;
     case 'presence': S.online = m.device_online; renderDevice(); break;
-    case 'telemetry': setTelemetry(m); renderDevice(); break;
+    case 'telemetry': setTelemetry(m); pushTemp(m.temp); renderDevice(); renderSensor(m.fire, m.fire_score); break;
+    case 'alert': showAlert(m); break;
+    case 'alert_clear': hideAlert(); break;
     case 'output': S.output = m.output; renderOutput(); renderState(); break;
     case 'status': S.status = m.status; renderState(); break;
     case 'conversation':
@@ -248,7 +283,6 @@ const setTelemetry = t => telemetry = { temp:t.temp, hum:t.hum };
 function renderDevice(){
   $('#dot').classList.toggle('on', S.online);
   let text = !S.connected ? 'Reconnecting…' : S.online ? 'Speaker online' : 'Speaker offline';
-  if (S.online && telemetry.temp != null) text += `, ${telemetry.temp} °C, ${telemetry.hum}% humidity`;
   $('#devText').textContent = text;
 }
 function renderOutput(){
@@ -258,10 +292,47 @@ function renderOutput(){
 function renderState(){
   const el = $('#state'), busy = S.status !== 'idle';
   const where = S.output === 'device' ? 'on the speaker' : 'on this phone';
-  el.textContent = { idle:'', transcribing:'Transcribing…', thinking:'Thinking…', speaking:`Speaking ${where}` }[S.status] || '';
+  el.textContent = { idle:'', listening:'Listening on the speaker…', transcribing:'Transcribing…', thinking:'Thinking…', speaking:`Speaking ${where}` }[S.status] || '';
   el.classList.toggle('live', busy);
   $('#stop').hidden = !busy; $('#send').hidden = busy;
 }
+
+/* ---------- Live sensor strip and fire alert ---------- */
+const temps = [];
+function pushTemp(t){ if (typeof t === 'number'){ temps.push(t); if (temps.length > 60) temps.shift(); } }
+function renderRisk(score){
+  const pct = typeof score === 'number' ? Math.round(score * 100) : null;
+  $('#riskLabel').textContent = pct === null ? 'Spike risk --' : `Spike risk ${pct}%`;
+  $('#riskFill').style.width = (pct || 0) + '%';
+  $('#risk').classList.toggle('hot', pct !== null && pct >= 50);
+}
+function renderSensor(fire, score){
+  renderRisk(score);
+  $('#tNow').textContent = telemetry.temp != null ? Number(telemetry.temp).toFixed(1) : '--';
+  $('#hNow').textContent = telemetry.hum != null ? `${Number(telemetry.hum).toFixed(0)}% humidity` : '';
+  const b = $('#sBadge'); b.textContent = fire ? 'FIRE ALERT' : 'Normal'; b.classList.toggle('fire', !!fire);
+  $('#spark').classList.toggle('fire', !!fire);
+  if (temps.length > 1){
+    const lo = Math.min(...temps), hi = Math.max(...temps), range = Math.max(hi - lo, 4), pad = (range - (hi - lo)) / 2;
+    $('#sparkLine').setAttribute('points', temps.map((t, i) =>
+      `${(i * 160 / 59).toFixed(1)},${(34 - (t - lo + pad) / range * 32).toFixed(1)}`).join(' '));
+  }
+}
+function beep(){
+  if (!actx || actx.state !== 'running') return;
+  for (let i = 0; i < 3; i++){
+    const o = actx.createOscillator(), g = actx.createGain(), t = actx.currentTime + i * 0.35;
+    o.frequency.value = 880; g.gain.setValueAtTime(0.25, t); g.gain.setValueAtTime(0, t + 0.2);
+    o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + 0.22);
+  }
+}
+function showAlert(a, quiet){
+  $('#alertText').textContent = a.text || 'Temperature is rising rapidly.';
+  $('#alert').hidden = false; document.title = 'FIRE ALERT - Speaker';
+  if (!quiet){ beep(); if (navigator.vibrate) navigator.vibrate([300, 150, 300, 150, 300]); }
+}
+function hideAlert(){ $('#alert').hidden = true; document.title = 'Speaker'; }
+$('#ackBtn').onclick = () => send({ type:'ack_alert' });
 
 const msgs = $('#msgs');
 function scrollDown(force){
