@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py fire_model.py fire_model.json ./
 COPY static ./static
 
 # Render injects PORT (default 10000); fall back to it locally too.
