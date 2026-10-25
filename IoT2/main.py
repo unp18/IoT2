@@ -1,27 +1,31 @@
 """
-IoT Smart Speaker backend
 IoT Smart Speaker backend (PostgreSQL Version)
 Pipeline:  audio/text in -> Whisper (Groq) -> LLM (Groq, streaming, tools)
            -> sentence-level edge-tts -> ffmpeg -> 16 kHz/16-bit/mono PCM -> ESP32
+Safety:    every telemetry reading -> trained spike model (fire_model.json) -> alert + voice alarm + dashboard
+
 WebSocket:  /ws/{device_id}?role=device|client&token=...
 Client -> server (JSON text frames)
   {"type":"text","text":"...","conversation_id":"<optional>"}
-  {"type":"audio_meta","mime":"audio/webm","conversation_id":"<optional>"}   then ONE binary frame
+  {"type":"audio_meta","mime":"audio/webm","conversation_id":"<optional>"}   then binary frame(s), then {"type":"audio_end"}
   {"type":"set_output","output":"device"|"client"}
+  {"type":"ack_alert"}                 acknowledge a fire alert (silences the voice, clears the banner)
   {"type":"stop"}
   {"type":"ping"}
 Device -> server
   {"type":"telemetry","temp":24.1,"hum":55}
-  {"type":"audio_meta","mime":"audio/pcm"}  then ONE binary frame of raw PCM (future mic)
+  {"type":"audio_meta","mime":"audio/pcm"}  then binary PCM frame(s), then {"type":"audio_end"}
 Server -> everyone
   {"type":"status","state":"idle|transcribing|thinking|speaking"}
 Server -> clients
-  {"type":"hello", ...}              {"type":"presence","device_online":bool}
+  {"type":"hello", ..., "alert": <active alert or null>}     {"type":"presence","device_online":bool}
   {"type":"conversation","conversation":{id,title}}
   {"type":"message","role":"user|assistant","id","text","conversation_id","source","created_at"}
   {"type":"message_start","role":"assistant","conversation_id"}
   {"type":"token","conversation_id","text"}
-  {"type":"telemetry","temp","hum"}  {"type":"output","output":"device|client"}
+  {"type":"telemetry","temp","hum","fire":bool,"fire_score":0..1|null}     {"type":"output","output":"device|client"}
+  {"type":"alert","kind":"fire","level":"critical","text","temp","rise","score","detector","ts"}
+  {"type":"alert_clear","kind":"fire","reason":"..."}
   {"type":"info"|"error"|"warning","text":"..."}
 Server -> audio target (device or client, depending on set_output)
   {"type":"audio_start","rate":16000,"bits":16,"ch":1}
@@ -41,7 +45,12 @@ import time
 import uuid
 import wave
 import io
+import smtplib
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from email.message import EmailMessage
+from pathlib import Path
 from typing import Optional
 
 import edge_tts
@@ -50,7 +59,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from groq import AsyncGroq
 from pydantic import BaseModel
-from sqlalchemy import DateTime, Float, ForeignKey, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, create_engine, select, update
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -59,6 +68,8 @@ from sqlalchemy.orm import (
     relationship,
     sessionmaker,
 )
+
+from fire_model import FireModel, SpikeDetector
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -84,12 +95,40 @@ SAMPLE_RATE = 16000
 BYTES_PER_SEC = SAMPLE_RATE * 2   # 16-bit mono
 CHUNK_BYTES = 4096                # 128 ms of audio
 LEAD_SECONDS = 1.0                # never get more than ~1 s ahead of real-time playback
-SENSOR_LOG_INTERVAL = 60          # seconds between telemetry DB writes
+# Seconds between telemetry DB writes. Use 1 while recording training data (see train_fire_model.py).
+SENSOR_LOG_INTERVAL = int(os.getenv("SENSOR_LOG_INTERVAL", "60"))
+
+# Fire / sudden temperature spike detection (trained model in fire_model.json, see train_fire_model.py)
+FIRE_MODEL_PATH = Path(os.getenv("FIRE_MODEL_PATH", str(Path(__file__).parent / "fire_model.json")))
+_thr = os.getenv("FIRE_THRESHOLD")
+FIRE_THRESHOLD = float(_thr) if _thr else None                  # None = use the threshold saved with the model
+FIRE_MIN_TEMP = float(os.getenv("FIRE_MIN_TEMP", "35.0"))       # safety gate: never alarm below this temperature
+FIRE_CLEAR_TEMP = float(os.getenv("FIRE_CLEAR_TEMP", str(FIRE_MIN_TEMP - 3)))   # alert auto-clears below this
+FIRE_CONFIRMATIONS = int(os.getenv("FIRE_CONFIRMATIONS", "3"))  # consecutive positive windows required
+FIRE_MAX_GAP = float(os.getenv("FIRE_MAX_GAP", "5"))            # seconds without data that resets the window
+FIRE_REPEAT_SECONDS = int(os.getenv("FIRE_REPEAT_SECONDS", "20"))
+FIRE_MAX_ANNOUNCEMENTS = int(os.getenv("FIRE_MAX_ANNOUNCEMENTS", "5"))
+ALARM_TEXT = "Warning! Possible fire detected in the room. Please check immediately."
+
+# Email alerts. Render's free tier BLOCKS outbound SMTP (ports 25/465/587), so prefer an HTTPS email API:
+#   EMAIL_PROVIDER = resend | brevo | smtp      (empty = email alerts disabled)
+EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "").strip().lower()
+EMAIL_API_KEY = os.getenv("EMAIL_API_KEY", "")                  # resend / brevo API key
+ALERT_EMAIL_TO = [e.strip() for e in os.getenv("ALERT_EMAIL_TO", "").split(",") if e.strip()]
+ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "")            # resend: optional; brevo: a verified sender; smtp: optional
+EMAIL_COOLDOWN_SECONDS = int(os.getenv("EMAIL_COOLDOWN_SECONDS", "300"))   # at most one alert email per this many seconds
+APP_URL = os.getenv("APP_URL", "")                              # e.g. https://your-service.onrender.com (adds a link)
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+RESEND_URL = "https://api.resend.com/emails"
+BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
 SYSTEM_PROMPT = (
     "You are a smart speaker assistant. Your replies are spoken aloud, so keep them brief, "
     "natural and conversational. Do not use markdown, lists, emojis or code blocks. "
-    "Use the get_dht_sensor_data tool when asked about room temperature, humidity or climate."
+    "Use the get_dht_sensor_data tool when asked about room temperature, humidity, climate or fire risk."
 )
 
 HALLUCINATIONS = {"", "you", "thank you", "thanks", "thanks for watching", "bye", "okay"}
@@ -100,6 +139,14 @@ if not DEVICE_TOKEN:
     log.warning("DEVICE_TOKEN is not set: devices will be rejected")
 if not shutil.which("ffmpeg"):
     log.warning("ffmpeg not found on PATH: TTS audio conversion will fail")
+
+try:
+    fire_model: Optional[FireModel] = FireModel.load(FIRE_MODEL_PATH)
+    log.info("Loaded fire model: window=%d threshold=%.2f trained_at=%s",
+             fire_model.window, FIRE_THRESHOLD or fire_model.threshold, fire_model.spec.get("trained_at"))
+except Exception as e:
+    fire_model = None
+    log.warning("Fire model not loaded (%s): falling back to the simple rule-based detector", e)
 
 groq = AsyncGroq(api_key=GROQ_API_KEY)
 
@@ -149,6 +196,19 @@ class SensorLog(Base):
     device_id: Mapped[str] = mapped_column(String(50), index=True)
     temperature: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     humidity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+class Alert(Base):
+    __tablename__ = "alerts"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(50), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    message: Mapped[str] = mapped_column(Text)
+    temperature: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rise: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)       # model probability
+    detector: Mapped[Optional[str]] = mapped_column(String(10), nullable=True) # model | rules
+    acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 # Configure PostgreSQL Engine with connection pooling
@@ -208,6 +268,18 @@ def db_history(db: Session, conversation_id: str, limit: int) -> list[dict]:
 def db_log_sensor(db: Session, device_id: str, temp, hum):
     db.add(SensorLog(device_id=device_id, temperature=temp, humidity=hum))
 
+def db_add_alert(db: Session, device_id: str, kind: str, message: str, temp: float, rise: float,
+                 score: Optional[float], detector: str) -> dict:
+    alert = Alert(device_id=device_id, kind=kind, message=message, temperature=temp, rise=rise,
+                  score=score, detector=detector)
+    db.add(alert)
+    db.flush()
+    return {"id": alert.id, "created_at": iso(alert.created_at)}
+
+def db_ack_alerts(db: Session, device_id: str):
+    db.execute(update(Alert).where(Alert.device_id == device_id, Alert.acknowledged.is_(False))
+               .values(acknowledged=True))
+
 
 # -----------------------------------------------------------------------------
 # Rooms / connections
@@ -224,6 +296,15 @@ class Room:
         self.active_conversation: Optional[str] = None
         self.last_activity = 0.0
         self.last_sensor_log = 0.0
+        # fire detection state
+        self.detector = SpikeDetector(fire_model, window=10, threshold=FIRE_THRESHOLD, min_temp=FIRE_MIN_TEMP,
+                                      confirmations=FIRE_CONFIRMATIONS, max_gap=FIRE_MAX_GAP)
+        self.fire_active = False
+        self.alert: Optional[dict] = None
+        self.last_score: Optional[float] = None
+        self.last_announce = 0.0
+        self.announce_count = 0
+        self.last_email = 0.0
 
     def audio_targets(self) -> set[WebSocket]:
         return self.devices if self.output == "device" else self.clients
@@ -280,7 +361,8 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_dht_sensor_data",
-            "description": "Get the current room temperature (Celsius) and humidity from the ESP32 DHT sensor.",
+            "description": "Get the current room temperature (Celsius), humidity, and fire/temperature-spike status "
+                           "from the ESP32 sensor.",
             "parameters": {"type": "object", "properties": {}},
         },
     }
@@ -296,6 +378,8 @@ def run_tool(room: Room, name: str) -> str:
                 "temperature_celsius": t["temp"],
                 "humidity_percent": t["hum"],
                 "reading_age_seconds": int(time.time() - t["ts"]),
+                "fire_alert_active": room.fire_active,
+                "spike_risk_percent": None if room.last_score is None else round(room.last_score * 100),
             }
         )
     return json.dumps({"error": f"Unknown tool {name}"})
@@ -595,6 +679,177 @@ async def start_turn(room: Room, **kwargs):
     room.task = asyncio.create_task(run_turn(room, **kwargs))
 
 # -----------------------------------------------------------------------------
+# Fire / sudden temperature spike: trained model -> alert, voice alarm, dashboard
+# -----------------------------------------------------------------------------
+_alarm_pcm: dict[str, bytes] = {}      # synthesized once, replayed instantly afterwards
+
+async def run_announcement(room: Room, text: str):
+    """Speak an alert on the device(s) regardless of the reply-output setting."""
+    try:
+        await set_status(room, "speaking")
+        pcm = _alarm_pcm.get(text)
+        if pcm is None:
+            pcm = await synthesize(text)
+            _alarm_pcm[text] = pcm
+        if pcm and room.devices:
+            await room.to_devices({"type": "audio_start", "rate": SAMPLE_RATE, "bits": 16, "ch": 1})
+            pacer = Pacer()
+            for i in range(0, len(pcm), CHUNK_BYTES):
+                chunk = pcm[i : i + CHUNK_BYTES]
+                await room._send(room.devices, data=chunk)
+                await pacer.wait(len(chunk))
+            await room.to_devices({"type": "audio_end"})
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Announcement failed")
+    finally:
+        await set_status(room, "idle")
+
+async def clear_alert(room: Room, reason: str):
+    if not room.fire_active:
+        return
+    room.fire_active = False
+    room.alert = None
+    room.detector.reset()
+    await room.to_clients({"type": "alert_clear", "kind": "fire", "reason": reason})
+
+async def ack_alert(room: Room):
+    await adb(db_ack_alerts, room.device_id)
+    await cancel_turn(room)                      # silence the voice immediately
+    await clear_alert(room, "acknowledged")
+
+_bg_tasks: set = set()
+
+def _spawn(coro):
+    """Run a coroutine in the background without letting it be garbage-collected mid-flight."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+def email_configured() -> bool:
+    if not ALERT_EMAIL_TO:
+        return False
+    if EMAIL_PROVIDER in ("resend", "brevo"):
+        return bool(EMAIL_API_KEY)
+    if EMAIL_PROVIDER == "smtp":
+        return bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
+    return False
+
+def _post_json(url: str, headers: dict, payload: dict) -> int:
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "smart-speaker/1.0", **headers},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"{EMAIL_PROVIDER} API error {e.code}: {e.read().decode(errors='ignore')[:200]}") from None
+
+def send_email_sync(subject: str, body: str) -> None:
+    """Blocking send (call from a thread). Raises RuntimeError / OSError on failure."""
+    if not email_configured():
+        raise RuntimeError("Email is not configured (set EMAIL_PROVIDER, its credentials, and ALERT_EMAIL_TO)")
+    sender = ALERT_EMAIL_FROM
+    if EMAIL_PROVIDER == "resend":
+        _post_json(RESEND_URL, {"Authorization": f"Bearer {EMAIL_API_KEY}"},
+                   {"from": sender or "Smart Speaker <onboarding@resend.dev>", "to": ALERT_EMAIL_TO,
+                    "subject": subject, "text": body})
+    elif EMAIL_PROVIDER == "brevo":
+        if not sender:
+            raise RuntimeError("Brevo needs ALERT_EMAIL_FROM set to a verified sender address")
+        _post_json(BREVO_URL, {"api-key": EMAIL_API_KEY},
+                   {"sender": {"name": "Smart Speaker", "email": sender},
+                    "to": [{"email": e} for e in ALERT_EMAIL_TO], "subject": subject, "textContent": body})
+    else:                                                        # smtp
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = subject, sender or SMTP_USER, ", ".join(ALERT_EMAIL_TO)
+        msg.set_content(body)
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+                smtp.starttls()
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(msg)
+
+def build_alert_email(room: Room, alert: dict) -> tuple[str, str]:
+    hum = room.telemetry.get("hum")
+    subject = f"FIRE ALERT: {room.device_id} at {alert['temp']:.1f} °C (+{alert['rise']:.1f} °C)"
+    lines = [
+        "Possible fire detected by your smart speaker.",
+        "",
+        f"Device: {room.device_id}",
+        f"Time (UTC): {alert['ts']}",
+        f"Temperature: {alert['temp']:.1f} °C (rose {alert['rise']:.1f} °C over the last {room.detector.window} readings)",
+        f"Humidity: {hum}%" if hum is not None else None,
+        f"Model score: {alert['score']:.2f} ({alert['detector']})",
+        f"Dashboard: {APP_URL}" if APP_URL else None,
+        "",
+        "Check the room immediately. This is an automated alert from a demo project, not a certified fire alarm.",
+    ]
+    return subject, "\n".join(line for line in lines if line is not None)
+
+async def send_alert_email(room: Room, alert: dict):
+    """Email the alert (rate-limited). Never raises: failures are logged and shown on the dashboard."""
+    if not email_configured():
+        return
+    now = time.time()
+    if now - room.last_email < EMAIL_COOLDOWN_SECONDS:
+        log.info("Alert email skipped (cooldown)")
+        return
+    room.last_email = now
+    subject, body = build_alert_email(room, alert)
+    try:
+        await asyncio.to_thread(send_email_sync, subject, body)
+        log.info("Alert email sent to %s", ", ".join(ALERT_EMAIL_TO))
+        await room.to_clients({"type": "info", "text": f"Alert email sent to {', '.join(ALERT_EMAIL_TO)}."})
+    except Exception as e:
+        log.error("Alert email failed: %s", e)
+        await room.to_clients({"type": "warning", "text": f"Alert email failed: {e}"})
+
+async def check_fire(room: Room, temp, allow_voice: bool = True) -> Optional[float]:
+    """Run the model on the newest reading. Returns the model score (None while the window fills)."""
+    try:
+        temp = float(temp)
+    except (TypeError, ValueError):
+        return room.last_score
+    now = time.time()
+    score, triggered, rise = room.detector.update(temp, now)
+    room.last_score = score
+
+    if not room.fire_active:
+        if triggered:
+            room.fire_active = True
+            room.announce_count = 0
+            room.last_announce = 0.0
+            text = (f"Possible fire: temperature rose {rise:.1f} °C over the last "
+                    f"{room.detector.window} readings and is now {temp:.1f} °C.")
+            row = await adb(db_add_alert, room.device_id, "fire", text, temp, rise, score, room.detector.name)
+            room.alert = {"kind": "fire", "level": "critical", "text": text, "temp": temp,
+                          "rise": round(rise, 1), "score": round(score, 3),
+                          "detector": room.detector.name, "ts": row["created_at"]}
+            room.detector.reset()                # need fresh evidence before triggering again
+            log.warning("FIRE ALERT in %s: %s (score %.2f, %s)", room.device_id, text, score, room.detector.name)
+            await room.to_clients({"type": "alert", **room.alert})
+            _spawn(send_alert_email(room, room.alert))
+    elif temp < FIRE_CLEAR_TEMP:
+        await clear_alert(room, "temperature back to normal")
+
+    if (room.fire_active and allow_voice and room.devices
+            and room.announce_count < FIRE_MAX_ANNOUNCEMENTS
+            and now - room.last_announce >= FIRE_REPEAT_SECONDS):
+        room.last_announce = now
+        room.announce_count += 1
+        await cancel_turn(room)                  # an alarm outranks a conversation
+        room.task = asyncio.create_task(run_announcement(room, ALARM_TEXT))
+    return room.last_score
+
+# -----------------------------------------------------------------------------
 # App
 # -----------------------------------------------------------------------------
 app = FastAPI(title="IoT Smart Speaker API")
@@ -634,7 +889,7 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
 
     await ws.send_text(json.dumps({
         "type": "hello", "role": role, "device_online": bool(room.devices),
-        "output": room.output, "status": room.status,
+        "output": room.output, "status": room.status, "alert": room.alert,
         "telemetry": {"temp": room.telemetry["temp"], "hum": room.telemetry["hum"]},
     }))
     await room.to_clients({"type": "presence", "device_online": bool(room.devices)})
@@ -684,7 +939,10 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
                 if kind == "telemetry" and role == "device":
                     temp, hum = data.get("temp"), data.get("hum")
                     room.telemetry = {"temp": temp, "hum": hum, "ts": time.time()}
-                    await room.to_clients({"type": "telemetry", "temp": temp, "hum": hum})
+                    score = await check_fire(room, temp, allow_voice=(not pending_audio))
+                    await room.to_clients({"type": "telemetry", "temp": temp, "hum": hum,
+                                           "fire": room.fire_active,
+                                           "fire_score": None if score is None else round(score, 3)})
                     if time.time() - room.last_sensor_log > SENSOR_LOG_INTERVAL:
                         room.last_sensor_log = time.time()
                         await adb(db_log_sensor, device_id, temp, hum)
@@ -716,6 +974,9 @@ async def ws_endpoint(ws: WebSocket, device_id: str,
                 elif kind == "set_output" and data.get("output") in ("device", "client"):
                     room.output = data["output"]
                     await room.to_clients({"type": "output", "output": room.output})
+
+                elif kind == "ack_alert" and role == "client":
+                    await ack_alert(room)
 
                 elif kind == "stop":
                     await cancel_turn(room)
@@ -760,8 +1021,37 @@ def health():
 def device_status(device_id: str):
     room = manager.get(device_id)
     return {"device_id": device_id, "online": bool(room.devices), "output": room.output,
-            "status": room.status,
+            "status": room.status, "fire_alert": room.alert, "email_alerts": email_configured(),
             "telemetry": {"temp": room.telemetry["temp"], "hum": room.telemetry["hum"]}}
+
+@app.get("/api/model", dependencies=[Depends(require_client)])
+def model_info():
+    """Details of the deployed analytics model: dataset, metrics, comparison (for the dashboard / report)."""
+    if fire_model is None:
+        return {"loaded": False, "detector": "rules"}
+    return {"loaded": True, "detector": "model", **fire_model.info(),
+            "runtime": {"min_temp": FIRE_MIN_TEMP, "confirmations": FIRE_CONFIRMATIONS,
+                        "threshold": FIRE_THRESHOLD or fire_model.threshold}}
+
+@app.post("/api/test-email", dependencies=[Depends(require_client)])
+def test_email():
+    """Send a test message to check the email settings without needing a fire."""
+    if not email_configured():
+        raise HTTPException(400, "Email is not configured: set EMAIL_PROVIDER, its credentials and ALERT_EMAIL_TO")
+    try:
+        send_email_sync("Smart speaker test email",
+                        "This is a test message from your smart speaker server. Email alerts are working.")
+    except Exception as e:
+        raise HTTPException(502, f"Email failed: {e}")
+    return {"sent": True, "to": ALERT_EMAIL_TO, "provider": EMAIL_PROVIDER}
+
+@app.get("/api/alerts", dependencies=[Depends(require_client)])
+def list_alerts(device_id: str, limit: int = Query(50, le=200), db: Session = Depends(get_db)):
+    rows = db.scalars(select(Alert).where(Alert.device_id == device_id)
+                      .order_by(Alert.created_at.desc()).limit(limit)).all()
+    return [{"id": a.id, "kind": a.kind, "message": a.message, "temperature": a.temperature,
+             "rise": a.rise, "score": a.score, "detector": a.detector,
+             "acknowledged": a.acknowledged, "created_at": iso(a.created_at)} for a in rows]
 
 @app.get("/api/conversations", dependencies=[Depends(require_client)])
 def list_conversations(device_id: str, limit: int = Query(50, le=200), db: Session = Depends(get_db)):
@@ -822,7 +1112,6 @@ def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
 # -----------------------------------------------------------------------------
 # Frontend (served last so it never shadows /api or /ws)
 # -----------------------------------------------------------------------------
-from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 
 _static = Path(__file__).parent / "static"
