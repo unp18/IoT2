@@ -318,42 +318,33 @@ function renderSensor(fire, score){
       `${(i * 160 / 59).toFixed(1)},${(34 - (t - lo + pad) / range * 32).toFixed(1)}`).join(' '));
   }
 }
-/* ---- Phone alarm sound: edit these values to change it ---- */
-const PHONE_ALARM = {
-  style: 'wail',
-  lowHz: 1800, highHz: 2800,
-  seconds: 5,
-  volume: 0.5,
-  wave: 'square',
-  vibrate: [400, 150, 400, 150, 400]
-};
-function beep(){                  // called by showAlert() when a fire alert arrives
-  if (!actx || actx.state !== 'running') return;
-  const A = PHONE_ALARM, t0 = actx.currentTime + 0.05, end = t0 + A.seconds;
-  const o = actx.createOscillator(), g = actx.createGain();
-  o.type = A.wave; o.connect(g); g.connect(actx.destination);
-  g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(A.volume, t0 + 0.02);
-  if (A.style === 'beep'){
-    o.frequency.setValueAtTime(A.highHz, t0);
-    for (let t = t0; t < end; t += 0.5){ g.gain.setValueAtTime(A.volume, t); g.gain.setValueAtTime(0, t + 0.25); }
-  } else {
-    if (A.style === 'twotone'){
-      for (let t = t0, hi = true; t < end; t += 0.5, hi = !hi) o.frequency.setValueAtTime(hi ? A.highHz : A.lowHz, t);
-    } else {                      // wail / yelp: smooth low -> high -> low
-      const half = (A.style === 'yelp' ? 0.4 : 3) / 2;
-      o.frequency.setValueAtTime(A.lowHz, t0);
-      for (let t = t0, up = true; t < end; t += half, up = !up) o.frequency.linearRampToValueAtTime(up ? A.highHz : A.lowHz, t + half);
-    }
-    g.gain.setValueAtTime(A.volume, end - 0.05); g.gain.linearRampToValueAtTime(0, end);
-  }
-  o.start(t0); o.stop(end + 0.02);
-}
+
+/* ---- Fire Alarm Audio ---- */
+const fireAlarmAudio = new Audio('/siren.mp3');
+fireAlarmAudio.loop = true;
+
 function showAlert(a, quiet){
   $('#alertText').textContent = a.text || 'Temperature is rising rapidly.';
   $('#alert').hidden = false; document.title = 'FIRE ALERT - Speaker';
-  if (!quiet){ beep(); if (navigator.vibrate && PHONE_ALARM.vibrate.length) navigator.vibrate(PHONE_ALARM.vibrate); }
+  
+  if (!quiet){
+    // Play the MP3 siren
+    if (fireAlarmAudio.paused) {
+        fireAlarmAudio.play().catch(e => console.error("Autoplay blocked:", e));
+    }
+    // Vibrate the phone if supported
+    if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 400]);
+  }
 }
-function hideAlert(){ $('#alert').hidden = true; document.title = 'Speaker'; }
+
+function hideAlert(){ 
+  $('#alert').hidden = true; document.title = 'Speaker'; 
+  
+  // Stop the MP3 siren
+  fireAlarmAudio.pause();
+  fireAlarmAudio.currentTime = 0;
+}
+
 $('#ackBtn').onclick = () => send({ type:'ack_alert' });
 
 const msgs = $('#msgs');
