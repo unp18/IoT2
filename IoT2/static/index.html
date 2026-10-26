@@ -320,12 +320,12 @@ function renderSensor(fire, score){
 }
 /* ---- Phone alarm sound: edit these values to change it ---- */
 const PHONE_ALARM = {
-  style: 'wail',                  // 'wail' (slow sweep) | 'yelp' (fast sweep) | 'twotone' (alternating) | 'beep' (pulses)
-  lowHz: 700, highHz: 1500,       // pitch range (2000-3000 is the most piercing on a phone speaker)
-  seconds: 4,                     // how long it sounds
-  volume: 0.4,                    // 0 to 1 (the phone's own volume still applies)
-  wave: 'sawtooth',               // 'sine' (soft) | 'triangle' | 'sawtooth' | 'square' (harshest)
-  vibrate: [300, 150, 300, 150, 300]   // vibration pattern in ms; use [] to turn vibration off
+  style: 'wail',
+  lowHz: 1800, highHz: 2800,
+  seconds: 5,
+  volume: 0.5,
+  wave: 'square',
+  vibrate: [400, 150, 400, 150, 400]
 };
 function beep(){                  // called by showAlert() when a fire alert arrives
   if (!actx || actx.state !== 'running') return;
