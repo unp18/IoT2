@@ -103,7 +103,7 @@ FIRE_MODEL_PATH = Path(os.getenv("FIRE_MODEL_PATH", str(Path(__file__).parent / 
 _thr = os.getenv("FIRE_THRESHOLD")
 FIRE_THRESHOLD = float(_thr) if _thr else None                  # None = use the threshold saved with the model
 FIRE_MIN_TEMP = float(os.getenv("FIRE_MIN_TEMP", "35.0"))       # safety gate: never alarm below this temperature
-FIRE_CLEAR_TEMP = float(os.getenv("FIRE_CLEAR_TEMP", str(FIRE_MIN_TEMP - 3)))   # alert auto-clears below this
+FIRE_CLEAR_TEMP = float(os.getenv("FIRE_CLEAR_TEMP", "32.0"))   # alert auto-clears below this
 FIRE_CONFIRMATIONS = int(os.getenv("FIRE_CONFIRMATIONS", "3"))  # consecutive positive windows required
 FIRE_MAX_GAP = float(os.getenv("FIRE_MAX_GAP", "5"))            # seconds without data that resets the window
 FIRE_REPEAT_SECONDS = int(os.getenv("FIRE_REPEAT_SECONDS", "20"))
@@ -712,6 +712,7 @@ async def clear_alert(room: Room, reason: str):
     room.fire_active = False
     room.alert = None
     room.detector.reset()
+    # This automatically tells the frontend to stop the alarm
     await room.to_clients({"type": "alert_clear", "kind": "fire", "reason": reason})
 
 async def ack_alert(room: Room):
